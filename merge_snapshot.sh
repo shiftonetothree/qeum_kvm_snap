@@ -56,18 +56,72 @@ for s in $ALL_SNAPS; do
     fi
 done
 
+# 场景 A: 处理最末端节点 (向后合并)
 if [ ${#CHILDREN[@]} -eq 0 ]; then
-    echo "ℹ️ 提示：该快照是链条最末端，无后续镜像需重定向。"
-    read -p "是否仅清理该快照及其祖先的元数据？(y/N): " ONLY_META
-    if [[ "$ONLY_META" == "y" || "$ONLY_META" == "Y" ]]; then
-        curr="$TARGET_SNAP"
-        while [[ -n "$curr" ]]; do
-            PARENT=$(virsh snapshot-parent "$VM_NAME" "$curr" 2>/dev/null || echo "")
-            virsh snapshot-delete "$VM_NAME" "$curr" --metadata && echo "已清理元数据: $curr"
-            curr="$PARENT"
-        done
+    # 1. 获取当前物理路径
+    TARGET_FILE=$(virsh snapshot-dumpxml "$VM_NAME" "$TARGET_SNAP" | grep "<source file=" | head -n 1 | cut -d"'" -f2)
+    
+    # 2. 追溯最底层的 Base 镜像 (原始磁盘)
+    # 使用 qemu-img 查找链条末端的那个文件
+    BASE_FILE=$(qemu-img info "$TARGET_FILE" --backing-chain | grep "image:" | tail -n 1 | cut -d":" -f2 | xargs)
+    
+    if [[ "$TARGET_FILE" == "$BASE_FILE" ]]; then
+        echo "ℹ️ 提示：当前已是独立磁盘，无父级快照可合并。"
+        exit 0
+    fi
+
+    # 3. 收集所有待清理的中间物理文件 (从当前往回找，直到 BASE)
+    EXPIRED_FILES=()
+    TEMP_PATH="$TARGET_FILE"
+    while true; do
+        # 获取当前文件的父镜像
+        P_FILE=$(qemu-img info "$TEMP_PATH" | grep "backing file:" | cut -d":" -f2 | xargs)
+        if [[ -z "$P_FILE" ]]; then break; fi
+        
+        EXPIRED_FILES+=("$TEMP_PATH")
+        TEMP_PATH="$P_FILE"
+    done
+
+    echo "📊 检测到末端节点，即将执行【全链条合并】："
+    echo " 1. 数据流向: $TARGET_SNAP 及其所有祖先 -> 写入 $BASE_FILE"
+    echo " 2. 待删除物理文件: ${EXPIRED_FILES[*]}"
+    echo " 3. 虚拟机配置: 将重定向至 $BASE_FILE"
+    echo "------------------------------------------------"
+    read -p "确认执行全链条合并？(y/N): " CONFIRM
+
+    if [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]]; then
+        echo "🚀 正在执行全链条数据合并 (此操作耗时较长)..."
+        # qemu-img commit 会将数据逐级向上（向 Base 方向）提交
+        if qemu-img commit -p "$TARGET_FILE"; then
+            
+            echo "🚀 正在更新虚拟机磁盘配置..."
+            virsh dumpxml "$VM_NAME" > /tmp/${VM_NAME}_bak.xml
+            sed "s|source file='$TARGET_FILE'|source file='$BASE_FILE'|g" /tmp/${VM_NAME}_bak.xml > /tmp/${VM_NAME}_new.xml
+            virsh define /tmp/${VM_NAME}_new.xml
+
+            echo "🚀 正在清理物理文件..."
+            for f in "${EXPIRED_FILES[@]}"; do
+                [ -f "$f" ] && rm -v "$f"
+            done
+
+            echo "🚀 正在递归清理所有快照元数据..."
+            # 从当前快照开始向上清理所有元数据
+            CURR_MD="$TARGET_SNAP"
+            while [[ -n "$CURR_MD" ]]; do
+                PARENT_MD=$(virsh snapshot-parent "$VM_NAME" "$CURR_MD" 2>/dev/null || echo "")
+                echo "清理元数据: $CURR_MD"
+                virsh snapshot-delete "$VM_NAME" "$CURR_MD" --metadata
+                CURR_MD="$PARENT_MD"
+            done
+
+            echo "✅ 全链条合并完成！虚拟机现在运行在原始磁盘 $BASE_FILE 上。"
+        else
+            echo "❌ 错误：数据合并过程中发生异常。"
+            exit 1
+        fi
     fi
     exit 0
+
 elif [ ${#CHILDREN[@]} -gt 1 ]; then
     echo "❓ 发现该快照有多个直接分支: ${CHILDREN[*]}"
     while true; do
